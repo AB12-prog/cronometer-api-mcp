@@ -706,6 +706,10 @@ class OAuthAuthorizationMiddleware:
     - MCP_BASE_URL: Public base URL (for metadata endpoints)
     """
 
+    # Auth codes are one-shot and only need to survive the browser redirect
+    # back to Claude, so keep the window tight.
+    CODE_TTL_SECONDS = 600
+
     def __init__(
         self,
         app,
@@ -740,7 +744,6 @@ class OAuthAuthorizationMiddleware:
                     "issuer": self.base_url,
                     "authorization_endpoint": f"{self.base_url}/authorize",
                     "token_endpoint": f"{self.base_url}/token",
-                    "registration_endpoint": f"{self.base_url}/register",
                     "token_endpoint_auth_methods_supported": [
                         "client_secret_post",
                     ],
@@ -796,10 +799,13 @@ class OAuthAuthorizationMiddleware:
             await Response(status_code=404)(scope, receive, send)
             return
 
-        # All other requests: validate bearer token
+        # All other requests: validate bearer token (timing-safe)
+        import hmac as _hmac
+
         headers = dict(scope.get("headers", []))
         auth_value = headers.get(b"authorization", b"").decode()
-        if auth_value != f"Bearer {self.access_token}":
+        expected = f"Bearer {self.access_token}"
+        if not _hmac.compare_digest(auth_value.encode(), expected.encode()):
             from starlette.responses import Response
 
             # Return 401 with WWW-Authenticate header per MCP spec
@@ -819,31 +825,15 @@ class OAuthAuthorizationMiddleware:
     async def _handle_register(self, scope, receive, send):
         """Handle POST /register (OAuth 2.0 Dynamic Client Registration).
 
-        Minimal implementation that accepts any registration and returns
-        the provided client_name with pre-configured credentials.
+        SECURITY: dynamic registration previously returned the REAL
+        client_secret to any unauthenticated caller, defeating client
+        authentication entirely. This deployment uses manually configured
+        credentials in Claude.ai, so registration is disabled.
         """
         from starlette.responses import JSONResponse
 
-        body = await self._read_body(receive)
-        try:
-            import json as _json
-
-            data = _json.loads(body)
-        except Exception:
-            data = {}
-
-        response = JSONResponse(
-            {
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "client_name": data.get("client_name", "mcp-client"),
-                "redirect_uris": data.get("redirect_uris", []),
-                "grant_types": ["authorization_code"],
-                "response_types": ["code"],
-                "token_endpoint_auth_method": "client_secret_post",
-            },
-            status_code=201,
-        )
+        await self._read_body(receive)
+        response = JSONResponse({"error": "registration_disabled"}, status_code=403)
         await response(scope, receive, send)
 
     async def _handle_authorize(self, scope, receive, send):
@@ -868,6 +858,25 @@ class OAuthAuthorizationMiddleware:
             await response(scope, receive, send)
             return
 
+        # SECURITY: only redirect authorization codes to Claude's own
+        # callback endpoints — never to arbitrary attacker-supplied URLs.
+        if not (redirect_uri.startswith("https://claude.ai/") or redirect_uri.startswith("https://claude.com/")):
+            from starlette.responses import JSONResponse
+
+            response = JSONResponse({"error": "invalid_redirect_uri"}, status_code=400)
+            await response(scope, receive, send)
+            return
+
+        # SECURITY: escape every request-controlled value before embedding it
+        # in the page, otherwise a crafted /authorize link is reflected XSS.
+        from html import escape
+
+        e_client_id = escape(client_id or "", quote=True)
+        e_redirect_uri = escape(redirect_uri, quote=True)
+        e_code_challenge = escape(code_challenge, quote=True)
+        e_challenge_method = escape(code_challenge_method or "", quote=True)
+        e_state = escape(state or "", quote=True)
+
         # Render a simple approval page
         html = f"""<!DOCTYPE html>
 <html>
@@ -886,16 +895,16 @@ class OAuthAuthorizationMiddleware:
 <body>
     <h1>Authorize Cronometer MCP</h1>
     <div class="info">
-        <p><strong>Client:</strong> {client_id or "unknown"}</p>
+        <p><strong>Client:</strong> {e_client_id or "unknown"}</p>
         <p>This will grant access to your Cronometer nutrition data
            through the MCP protocol.</p>
     </div>
     <form method="POST" action="/authorize">
-        <input type="hidden" name="client_id" value="{client_id or ""}">
-        <input type="hidden" name="redirect_uri" value="{redirect_uri or ""}">
-        <input type="hidden" name="code_challenge" value="{code_challenge or ""}">
-        <input type="hidden" name="code_challenge_method" value="{code_challenge_method or ""}">
-        <input type="hidden" name="state" value="{state or ""}">
+        <input type="hidden" name="client_id" value="{e_client_id}">
+        <input type="hidden" name="redirect_uri" value="{e_redirect_uri}">
+        <input type="hidden" name="code_challenge" value="{e_code_challenge}">
+        <input type="hidden" name="code_challenge_method" value="{e_challenge_method}">
+        <input type="hidden" name="state" value="{e_state}">
         <button type="submit">Authorize</button>
     </form>
 </body>
@@ -924,12 +933,36 @@ class OAuthAuthorizationMiddleware:
             await response(scope, receive, send)
             return
 
+        # SECURITY: mirror the GET-side allowlist — codes only go to Claude.
+        if not (redirect_uri.startswith("https://claude.ai/") or redirect_uri.startswith("https://claude.com/")):
+            from starlette.responses import JSONResponse
+
+            response = JSONResponse({"error": "invalid_redirect_uri"}, status_code=400)
+            await response(scope, receive, send)
+            return
+
+        # Cap pending codes so unauthenticated POSTs can't grow memory
+        # unbounded: drop expired codes first, then evict oldest-first
+        # (dicts preserve insertion order) so spam can't flush a
+        # legitimate in-flight authorization all at once.
+        import time
+
+        now = time.monotonic()
+        self._pending_codes = {
+            c: p
+            for c, p in self._pending_codes.items()
+            if now - p["created"] < self.CODE_TTL_SECONDS
+        }
+        while len(self._pending_codes) >= 50:
+            self._pending_codes.pop(next(iter(self._pending_codes)))
+
         # Generate a one-time auth code
         code = secrets.token_urlsafe(32)
         self._pending_codes[code] = {
             "code_challenge": code_challenge,
             "code_challenge_method": code_challenge_method or "S256",
             "redirect_uri": redirect_uri,
+            "created": now,
         }
 
         # Redirect back to Claude.ai with the code
@@ -960,6 +993,27 @@ class OAuthAuthorizationMiddleware:
         grant_type = params.get("grant_type", [None])[0]
         code = params.get("code", [None])[0]
         code_verifier = params.get("code_verifier", [None])[0]
+        req_client_id = params.get("client_id", [None])[0] or ""
+        req_client_secret = params.get("client_secret", [None])[0] or ""
+
+        # SECURITY: PKCE alone does not authenticate the client — an attacker
+        # who POSTs /authorize with their own challenge can satisfy PKCE with
+        # their own verifier. The client secret is what proves the caller is
+        # the Claude connector you configured. Timing-safe comparison.
+        import hmac as _hmac
+
+        if not (
+            _hmac.compare_digest(req_client_id.encode(), self.client_id.encode())
+            and self.client_secret
+            and _hmac.compare_digest(req_client_secret.encode(), self.client_secret.encode())
+        ):
+            response = JSONResponse(
+                {"error": "invalid_client"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Basic"},
+            )
+            await response(scope, receive, send)
+            return
 
         if grant_type != "authorization_code":
             response = JSONResponse(
@@ -973,9 +1027,13 @@ class OAuthAuthorizationMiddleware:
             await response(scope, receive, send)
             return
 
-        # Look up and consume the auth code (single-use)
+        # Look up and consume the auth code (single-use, short-lived)
+        import time
+
         pending = self._pending_codes.pop(code, None)
-        if pending is None:
+        if pending is None or (
+            time.monotonic() - pending["created"] >= self.CODE_TTL_SECONDS
+        ):
             response = JSONResponse({"error": "invalid_grant"}, status_code=400)
             await response(scope, receive, send)
             return
@@ -1057,17 +1115,30 @@ def main():
         access_token = os.getenv("MCP_AUTH_TOKEN")
         base_url = os.getenv("MCP_BASE_URL", f"http://localhost:{port}")
 
-        if access_token:
-            logger.info("OAuth authorization code flow enabled")
-            app = OAuthAuthorizationMiddleware(
-                app,
-                client_id=client_id,
-                client_secret=client_secret,
-                access_token=access_token,
-                base_url=base_url,
+        # SECURITY: a remote (HTTP) server holding Cronometer credentials and
+        # write access must NEVER run unauthenticated. Fail closed at startup
+        # rather than silently exposing every tool to the public internet.
+        if not access_token:
+            raise SystemExit(
+                "MCP_AUTH_TOKEN is required for remote transports. Refusing to "
+                "start an unauthenticated server. Set MCP_AUTH_TOKEN (and "
+                "MCP_OAUTH_CLIENT_ID / MCP_OAUTH_CLIENT_SECRET)."
             )
-        else:
-            logger.warning("No auth configured -- server is unauthenticated")
+        if not client_id or not client_secret:
+            raise SystemExit(
+                "MCP_OAUTH_CLIENT_ID and MCP_OAUTH_CLIENT_SECRET are required: "
+                "the /token endpoint uses them to authenticate Claude. An empty "
+                "client_id would let requests omitting it pass the check."
+            )
+
+        logger.info("OAuth authorization code flow enabled")
+        app = OAuthAuthorizationMiddleware(
+            app,
+            client_id=client_id,
+            client_secret=client_secret,
+            access_token=access_token,
+            base_url=base_url,
+        )
 
         logger.info("Starting %s transport on %s:%d", transport, host, port)
         config = uvicorn.Config(app, host=host, port=port, log_level="info")
