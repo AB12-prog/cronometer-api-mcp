@@ -116,7 +116,7 @@ class CronometerClient:
         """
         try:
             raw = self._session_path.read_text()
-        except FileNotFoundError, OSError:
+        except (FileNotFoundError, OSError):
             return
         try:
             data = json.loads(raw)
@@ -185,7 +185,7 @@ class CronometerClient:
         payload = {
             "email": username,
             "password": password,
-            "timezone": "America/New_York",
+            "timezone": "Australia/Brisbane",
             "userCode": None,
             "build": "4.48.2 b2807-a",
             "device": "Android 14 (SDK 34), Google Pixel 6 Pro",
