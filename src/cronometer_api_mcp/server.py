@@ -1104,6 +1104,24 @@ def main():
         host = os.getenv("FASTMCP_HOST", "0.0.0.0")
         port = int(os.getenv("PORT", os.getenv("FASTMCP_PORT", "8000")))
 
+        # Tell the MCP transport-security layer which Host header to trust.
+        # This MCP version (>=1.28) enforces DNS-rebinding protection via a
+        # TransportSecuritySettings model — there is NO environment variable
+        # for it, so it must be set in code. Behind Railway the request Host is
+        # the public domain; without allow-listing it the framework returns
+        # "421 Misdirected Request / Invalid Host header". Derived from
+        # MCP_BASE_URL so it always matches the deployed domain.
+        _base = os.getenv("MCP_BASE_URL", "")
+        if _base:
+            from urllib.parse import urlparse
+            from mcp.server.transport_security import TransportSecuritySettings
+
+            _host = urlparse(_base).netloc or _base
+            mcp.settings.transport_security = TransportSecuritySettings(
+                allowed_hosts=[_host, f"{_host}:*"],
+                allowed_origins=[f"https://{_host}", f"http://{_host}"],
+            )
+
         if transport == "sse":
             app = mcp.sse_app()
         else:
